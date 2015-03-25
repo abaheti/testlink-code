@@ -104,6 +104,9 @@ class TestlinkXMLRPCServer extends IXR_Server
 
   /** Mapping bewteen external & internal test case ID */
   protected $tcaseE2I = null;
+
+  /** needed in order to manage logs */
+  protected $tlLogger = null;
   
   
   /**#@+
@@ -201,7 +204,7 @@ class TestlinkXMLRPCServer extends IXR_Server
   public static $versionNumberParamName = "version";
   public static $estimatedExecDurationParamName = "estimatedexecduration";
 
-
+  public static $prefixParamName = "prefix";
   
   /**#@-*/
   
@@ -222,14 +225,24 @@ class TestlinkXMLRPCServer extends IXR_Server
     $this->dbObj->db->SetFetchMode(ADODB_FETCH_ASSOC);
     $this->_connectToDB();
     
-    $this->tcaseMgr=new testcase($this->dbObj);
-    $this->tprojectMgr=new testproject($this->dbObj);
+    global $g_tlLogger;
+    $this->tlLogger = &$g_tlLogger;
+    $this->tlLogger->setDB($this->dbObj);
+ 
+    // This close the default transaction that is started
+    // when logger.class.php is included.    
+    $this->tlLogger->endTransaction();
+
+    $this->tcaseMgr = new testcase($this->dbObj);
+    $this->tprojectMgr = new testproject($this->dbObj);
     $this->tplanMgr = new testplan($this->dbObj);
     $this->tplanMetricsMgr = new tlTestPlanMetrics($this->dbObj);
-
-    $this->reqSpecMgr=new requirement_spec_mgr($this->dbObj);
-    $this->reqMgr=new requirement_mgr($this->dbObj);
+    $this->reqSpecMgr = new requirement_spec_mgr($this->dbObj);
+    $this->reqMgr = new requirement_mgr($this->dbObj);
     
+    $this->tprojectMgr->setAuditEventSource('API-XMLRPC');
+      
+
     $this->tables = $this->tcaseMgr->getDBTables();
     
     $resultsCfg = config_get('results');
@@ -369,7 +382,9 @@ class TestlinkXMLRPCServer extends IXR_Server
       {
         // Load User
         $this->user = tlUser::getByID($this->dbObj,$this->userID);  
-        $this->authenticated = true;        
+        $this->authenticated = true; 
+
+        $this->tlLogger->startTransaction('DEFAULT',null,$this->userID);
         return true;
       }        
     }
@@ -395,8 +410,12 @@ class TestlinkXMLRPCServer extends IXR_Server
   {
     $status_ok = true;
     $tprojectid = isset($context[self::$testProjectIDParamName]) ? 
-                  $context[self::$testProjectIDParamName] :
-                  $this->args[self::$testProjectIDParamName];
+                  $context[self::$testProjectIDParamName] : 0;
+
+    if($tprojectid == 0 && isset($this->args[self::$testProjectIDParamName]))
+    {
+      $tprojectid = $this->args[self::$testProjectIDParamName];
+    }  
 
     if(isset($context[self::$testPlanIDParamName]))
     {
@@ -564,15 +583,15 @@ class TestlinkXMLRPCServer extends IXR_Server
    * @return boolean
    * @access protected
    */    
-    protected function checkTestProjectID($messagePrefix='')
-    {
+   protected function checkTestProjectID($messagePrefix='')
+   {
       if(!($status=$this->_isTestProjectIDPresent()))
       {
           $this->errors[] = new IXR_Error(NO_TESTPROJECTID, $messagePrefix . NO_TESTPROJECTID_STR);
       }
       else
       {        
-            // See if this Test Project ID exists in the db
+        // See if this Test Project ID exists in the db
         $testprojectid = $this->dbObj->prepare_int($this->args[self::$testProjectIDParamName]);
         $query = "SELECT id FROM {$this->tables['testprojects']} WHERE id={$testprojectid}";
         $result = $this->dbObj->fetchFirstRowSingleColumn($query, "id");           
@@ -734,7 +753,7 @@ class TestlinkXMLRPCServer extends IXR_Server
    */         
   protected function _isParamPresent($pname,$messagePrefix='',$setError=false)
   {
-    $status_ok=(isset($this->args[$pname]) ? true : false);
+    $status_ok = (isset($this->args[$pname]) ? true : false);
     if(!$status_ok && $setError)
     {
       $msg = $messagePrefix . sprintf(MISSING_REQUIRED_PARAMETER_STR,$pname);
@@ -1674,7 +1693,7 @@ class TestlinkXMLRPCServer extends IXR_Server
   public function createTestProject($args)
   {
     $this->_setArgs($args);
-    $msg_prefix="(" . __FUNCTION__ . ") - ";
+    $msg_prefix = "(" . __FUNCTION__ . ") - ";
     $checkRequestMethod='_check' . ucfirst(__FUNCTION__) . 'Request';
   
     if( $this->$checkRequestMethod($msg_prefix) && 
@@ -1687,7 +1706,7 @@ class TestlinkXMLRPCServer extends IXR_Server
       $item->options->automationEnabled = 1;
       $item->options->inventoryEnabled = 1;
 
-      if( $this->_isParamPresent(self::$optionsParamName,$messagePrefix) )
+      if( $this->_isParamPresent(self::$optionsParamName,$msg_prefix) )
       {
         // has to be an array ?
         $dummy = $this->args[self::$optionsParamName];
@@ -3413,9 +3432,18 @@ public function getTestCaseAttachments($args)
     $operation=__FUNCTION__;
     $msg_prefix="({$operation}) - ";
     $checkFunctions = array('authenticate','checkTestSuiteName','checkTestProjectID');
-    $status_ok = $this->_runChecks($checkFunctions,$msg_prefix) && 
-                 $this->userHasRight("mgt_modify_tc",self::CHECK_PUBLIC_PRIVATE_ATTR);
-      
+    $status_ok = $this->_runChecks($checkFunctions,$msg_prefix);
+
+    // When working on PRIVATE containers, globalRole Admin is ENOUGH
+    // because this is how TestLink works when this action is done on GUI
+    if( $status_ok && $this->user->globalRole->dbID != TL_ROLES_ADMIN)
+    {
+      if( $this->userHasRight("mgt_modify_tc",self::CHECK_PUBLIC_PRIVATE_ATTR) )
+      {
+        $status_ok = true;
+      }  
+    }  
+
     if( $status_ok )
     {
       // Optional parameters
@@ -3709,14 +3737,14 @@ public function getTestCase($args)
    * @param struct $args
    * @param string $args["devKey"]
    * @param int $args["testplanname"]
-   * @param int $args["testprojectname"]
+   * @param int $args["testprojectname"] use instead of $args["prefix"]
+   * @param int $args["prefix"]          use instead of $args["testprojectname"] 
    * @param string $args["notes"], optional
    * @param string $args["active"], optional default value 1
    * @param string $args["public"], optional default value 1
-     *   
+   *   
    * @return mixed $resultInfo
-   * @internal revision
-   *  20100704 - franciscom - BUGID 3565
+   * @internal revisions
    */
   public function createTestPlan($args)
   {
@@ -3726,50 +3754,112 @@ public function getTestCase($args)
 
     if($this->authenticate())
     {
-      $keys2check = array(self::$testPlanNameParamName,self::$testProjectNameParamName);
-        
+      $keys2check = array(self::$testPlanNameParamName);
       $status_ok = true;
       foreach($keys2check as $key)
       {
-        $names[$key]=$this->_isParamPresent($key,$msg_prefix,self::SET_ERROR) ? trim($this->args[$key]) : '';
-        if($names[$key]=='')
+        $dummy[$key] = $this->_isParamPresent($key,$msg_prefix,self::SET_ERROR) ? 
+                       trim($this->args[$key]) : '';
+        if($dummy[$key]=='')
         {
           $status_ok=false;    
           break;
         }
       }
     }
+    
+    if( $status_ok )
+    {
+      $keys2check = array(self::$testProjectNameParamName,self::$prefixParamName);
+      $status_ok = true;
+      foreach($keys2check as $key)
+      {
+        $target[$key] = $this->_isParamPresent($key,$msg_prefix) ? 
+                        trim($this->args[$key]) : '';
+        if($target[$key] == '')
+        {
+          $status_ok = false;    
+        }
+        else
+        {
+          // first good match is OK
+          $status_ok = true;
+          break;
+        }  
+      }
+
+      if($status_ok == false)
+      {
+        // lazy way to generate error
+        foreach($keys2check as $key)
+        {
+          $dummy[$key] = $this->_isParamPresent($key,$msg_prefix) ? 
+                         trim($this->args[$key]) : '';
+          if($dummy[$key] == '')
+          {
+            $status_ok = false;
+            break;   
+          }
+        }
+      }  
+    }
 
     if( $status_ok )
     {
-      $name = trim($this->args[self::$testProjectNameParamName]);
-      $check_op=$this->tprojectMgr->checkNameExistence($name);
-      $status_ok=!$check_op['status_ok'];     
-      if($status_ok) 
+      $status_ok = false;
+
+      if( isset($target[self::$testProjectNameParamName]) &&
+          $target[self::$testProjectNameParamName] != '' )
       {
-        $tprojectInfo = current($this->tprojectMgr->get_by_name($name));
+        $name = trim($this->args[self::$testProjectNameParamName]);
+        $check_op = $this->tprojectMgr->checkNameExistence($name);
+        $status_ok = !$check_op['status_ok'];     
+        if($status_ok) 
+        {
+          $tprojectInfo = current($this->tprojectMgr->get_by_name($name));
+        }
+        else     
+        {
+          $status_ok=false;
+          $msg = $msg_prefix . sprintf(TESTPROJECTNAME_DOESNOT_EXIST_STR,$name);
+          $this->errors[] = new IXR_Error(TESTPROJECTNAME_DOESNOT_EXIST, $msg);
+        }
       }
-      else     
+      else
       {
-        $status_ok=false;
-        $msg = $msg_prefix . sprintf(TESTPROJECTNAME_DOESNOT_EXIST_STR,$name);
-        $this->errors[] = new IXR_Error(TESTPROJECTNAME_DOESNOT_EXIST, $msg);
-      }
+
+        if( isset($target[self::$prefixParamName]) &&
+            $target[self::$prefixParamName] != '' )
+        {
+          $prefix = trim($this->args[self::$prefixParamName]);
+          $tprojectInfo = $this->tprojectMgr->get_by_prefix($prefix);
+          
+          if( ($status_ok = !is_null($tprojectInfo)) == false )
+          {  
+            $msg = $msg_prefix . sprintf(TPROJECT_PREFIX_DOESNOT_EXIST_STR,$prefix);
+            $this->errors[] = new IXR_Error(TPROJECT_PREFIX_DOESNOT_EXIST_STR, $msg);
+          }
+        }
+      }  
     }
 
-    // Now we need to check if user has rights to work on testproject
+    // Now we need to check if user has rights to do this action
     if( $status_ok )
     {
       $this->args[self::$testProjectIDParamName] = $tprojectInfo['id'];
       $this->args[self::$testPlanIDParamName] = null;
 
-      $status_ok = $this->userHasRight("mgt_modify_product",self::CHECK_PUBLIC_PRIVATE_ATTR);
+      // When working on PRIVATE containers, globalRole Admin is ENOUGH
+      // because this is how TestLink works when this action is done on GUI
+      if( $this->user->globalRole->dbID != TL_ROLES_ADMIN)
+      {
+        $status_ok = $this->userHasRight("mgt_testplan_create",self::CHECK_PUBLIC_PRIVATE_ATTR);
+      }
     }  
-
 
     if( $status_ok )
     {
-      $name=trim($names[self::$testPlanNameParamName]);
+      $name = trim($this->args[self::$testPlanNameParamName]);
       $info = $this->tplanMgr->get_by_name($name,$tprojectInfo['id']);
       $status_ok=is_null($info);
             
@@ -6839,6 +6929,60 @@ protected function createAttachmentTempFile()
   }
 
   /**
+   *  Delete a test project and all related link to other items
+   *
+   * @param struct $args
+   * @param string $args["devKey"]
+   * @param int $args["prefix"]
+   *
+   * @return mixed $resultInfo
+   *         [status]  => true/false of success
+   *         [message]  => optional message for error message string
+   * @access public
+   */
+  public function deleteTestProject($args)
+  {
+    $resultInfo = array();
+    $operation=__FUNCTION__;
+    $msg_prefix="({$operation}) - ";
+     
+    $this->_setArgs($args);
+    $resultInfo[0]["status"] = false;
+     
+    $checkFunctions = array('authenticate');
+    $status_ok = $this->_runChecks($checkFunctions,$msg_prefix);
+    
+    if($status_ok)
+    {
+      $status_ok = $this->userHasRight("mgt_modify_product");
+    }
+  
+    if($status_ok)
+    {
+       $status_ok = $this->_isParamPresent(self::$prefixParamName,$msg_prefix,true);
+    }
+  
+    if($status_ok)
+    {
+      if( ($info = $this->tprojectMgr->get_by_prefix($this->args[self::$prefixParamName])) )
+      {
+        $this->tprojectMgr->delete($info['id']);
+        $resultInfo[0]["status"] = true;
+      }  
+      else
+      {
+        $status_ok = false;
+        $msg = $msg_prefix . sprintf(TPROJECT_PREFIX_DOESNOT_EXIST_STR,
+                             $this->args[self::$prefixParamName]);
+        $this->errors[] = new IXR_Error(TPROJECT_PREFIX_DOESNOT_EXIST, $msg);
+      }
+    }
+
+    return $status_ok ? $resultInfo : $this->errors;
+  }
+
+
+  /**
    *
    */
   function initMethodYellowPages()
@@ -6854,6 +6998,7 @@ protected function createAttachmentTempFile()
                             'tl.createTestSuite' => 'this:createTestSuite',
                             'tl.deleteTestCaseSteps' => 'this:deleteTestCaseSteps',
                             'tl.deleteTestPlan' => 'this:deleteTestPlan',
+                            'tl.deleteTestProject' => 'this:deleteTestProject',
                             'tl.uploadExecutionAttachment' => 'this:uploadExecutionAttachment',
                             'tl.uploadRequirementSpecificationAttachment' => 'this:uploadRequirementSpecificationAttachment',
                             'tl.uploadRequirementAttachment' => 'this:uploadRequirementAttachment',
